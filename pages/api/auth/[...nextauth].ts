@@ -1,44 +1,92 @@
-import NextAuth, { NextAuthOptions } from "next-auth"
-import GoogleProvider from "next-auth/providers/google"
-import FacebookProvider from "next-auth/providers/facebook"
-import GithubProvider from "next-auth/providers/github"
-import TwitterProvider from "next-auth/providers/twitter"
-import Auth0Provider from "next-auth/providers/auth0"
+import NextAuth, { NextAuthOptions } from "next-auth";
+import Auth0Provider from "next-auth/providers/auth0";
+import { getNewTokens } from "../../../utils/auth";
+import Redis from "ioredis";
+import Redlock from "redlock";
+import { JWT } from "next-auth/jwt";
 
-// For more information on each option (and a full list of options) go to
-// https://next-auth.js.org/configuration/options
+const getAccessTokenExpiration = (accessTokenExp: number) =>
+  (accessTokenExp - 86380) * 1000;
+
 export const authOptions: NextAuthOptions = {
-  // https://next-auth.js.org/configuration/providers/oauth
+  secret: process.env.NEXTAUTH_SECRET,
   providers: [
     Auth0Provider({
       clientId: process.env.AUTH0_ID,
       clientSecret: process.env.AUTH0_SECRET,
       issuer: process.env.AUTH0_ISSUER,
-    }),
-    FacebookProvider({
-      clientId: process.env.FACEBOOK_ID,
-      clientSecret: process.env.FACEBOOK_SECRET,
-    }),
-    GithubProvider({
-      clientId: process.env.GITHUB_ID,
-      clientSecret: process.env.GITHUB_SECRET,
-    }),
-    GoogleProvider({
-      clientId: process.env.GOOGLE_ID,
-      clientSecret: process.env.GOOGLE_SECRET,
-    }),
-    TwitterProvider({
-      clientId: process.env.TWITTER_ID,
-      clientSecret: process.env.TWITTER_SECRET,
-      version: "2.0",
+      authorization: {
+        params: {
+          scope: "openid email profile offline_access",
+        },
+      },
     }),
   ],
   callbacks: {
-    async jwt({ token }) {
-      token.userRole = "admin"
-      return token
+    async session({ session, token }) {
+      return { ...session, user: token.user };
+    },
+    async jwt({ token, account, user }) {
+      const redis = new Redis();
+
+      if (account && user) {
+        const jwtToken: JWT = {
+          accessToken: account.access_token,
+          refreshToken: account.refresh_token,
+          accessTokenExpires: getAccessTokenExpiration(account.expires_at),
+          userRole: "admin",
+          id: user.id,
+          user,
+        };
+
+        await redis.set(`token:${user.id}`, JSON.stringify(jwtToken));
+
+        return jwtToken;
+      }
+
+      if (Date.now() < token?.accessTokenExpires) {
+        return token;
+      }
+
+      const redlock = new Redlock([redis], {
+        driftFactor: 0.01,
+        retryCount: 10,
+        retryDelay: 200,
+        retryJitter: 200,
+        automaticExtensionThreshold: 500,
+      });
+
+      return await redlock.using([token.id, "jwt-refresh"], 5000, async () => {
+        const redisToken = await redis.get(`token:${token.id}`);
+
+        if (redisToken) {
+          const currentToken: JWT = JSON.parse(redisToken);
+
+          if (Date.now() < currentToken.accessTokenExpires) {
+            return currentToken;
+          }
+        }
+
+        const newTokens = await getNewTokens(token.refreshToken);
+
+        const date = new Date();
+        const accessTokenExpires = date.setDate(date.getDate() + 1);
+
+        const jwtToken: JWT = {
+          accessToken: newTokens.access_token as string,
+          refreshToken: newTokens.refresh_token as string,
+          accessTokenExpires,
+          userRole: "admin",
+          id: token.id,
+          user: token.user,
+        };
+
+        await redis.set(`token:${token.id}`, JSON.stringify(jwtToken));
+
+        return jwtToken;
+      });
     },
   },
-}
+};
 
-export default NextAuth(authOptions)
+export default NextAuth(authOptions);
